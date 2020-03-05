@@ -1,0 +1,10 @@
+Base path: '/Applications/Unity/Hub/Editor/2019.2.6f1/Unity.app/Contents', plugins path '/Applications/Unity/Hub/Editor/2019.2.6f1/PlaybackEngines'
+Cmd: initializeCompiler
+Cmd: compileComputeKernel
+  api=14 insize=3337 outsize=1505 ok=1
+Cmd: compileComputeKernel
+  error: 2 plat 14 at (8): failed to open source file: 'Resources/Struct.cginc'
+  error: 2 plat 14 at (9): failed to open source file: 'Resources/SortUtil.cginc'
+  api=14 insize=5817 outsize=0 ok=0
+
+Quitting shader compiler process

@@ -1,0 +1,190 @@
+﻿#pragma kernel CSMain  // カーネル関数を指定
+
+#define NUM_THREAD_X 8 // スレッド数 X成分
+#define NUM_THREAD_Y 1 // スレッド数 Y成分
+#define NUM_THREAD_Z 1 // スレッド数 Z成分
+#define boxSize 100 
+
+#define PI 3.14159265
+
+#include "../Resources/SortUtil.cginc"
+#include "../Resources/Struct.cginc"
+
+float hash( float n )
+{
+	return frac(sin(n)*43758.5453);
+}
+
+float noise1( float3 x )
+{
+	float3 p = floor(x);
+	float3 f = frac(x);
+
+	f       = f*f*(3.0-2.0*f);
+	float n = p.x + p.y*57.0 + 113.0*p.z;
+
+	return lerp(lerp(lerp( hash(n+0.0), hash(n+1.0),f.x),
+					lerp( hash(n+57.0), hash(n+58.0),f.x),f.y),
+				lerp(lerp( hash(n+113.0), hash(n+114.0),f.x),
+					lerp( hash(n+170.0), hash(n+171.0),f.x),f.y),f.z);
+}
+
+struct Boid
+{
+	float3 position;
+	float3 direction;
+	float noise_offset;
+	float speed;
+};
+
+struct Affector
+{
+    float3 position;
+    float force;
+};
+
+StructuredBuffer<Boid> boidBuffer_read;
+RWStructuredBuffer<Boid> boidBuffer_write; 
+RWStructuredBuffer<uint3> position_debug; 
+RWStructuredBuffer<Affector> affector_write; 
+
+cbuffer CB
+{
+	float DeltaTime;
+	float RotationSpeed;
+	float BoidSpeed;
+	float BoidSpeedVariation;
+	float3 FlockPosition;
+	float3 PlaneNormal;
+	float3 PlanePoint;
+	float NeighbourDistance;
+	uint BoidsCount;
+	// Affector Vairables
+	uint AffectorCount;
+	float AffectorForce;
+	float AffectorDistance; // Each boid needs to check the distance
+	uint useAffector;
+}
+
+float3 BoundaryCondition(float3 pos, float3 dir){
+    return float3(((pos.x >= boxSize - 10 && dir.x > 0) || (pos.x <= 10 && dir.x < 0)) ? -0.9 : 1,
+                  ((pos.y >= boxSize - 10 && dir.y > 0) || (pos.y <= 10 && dir.y < 0)) ? -0.9 : 1,
+                  ((pos.z >= boxSize - 10 && dir.z > 0) || (pos.z <= 10 && dir.z < 0)) ? -0.9 : 1);
+}
+
+float3 SetVectorLength(float3 v, float s){
+   float3 vectorNormalized = normalize(v); 
+   return vectorNormalized*s; 
+}
+
+float SignedDistancePlanePoint(float3 _point){
+    float3 diff = _point - PlanePoint;
+    return dot(PlaneNormal, diff);
+}
+
+float3 ProjectPointOnPlane(float3 _point){
+    float distance = SignedDistancePlanePoint(_point);
+    distance *= -1;
+    float3 translationVector = SetVectorLength(PlaneNormal, distance);
+    return _point + translationVector;
+}
+
+[numthreads(NUM_THREAD_X,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	uint instanceId = id.x;
+	Boid boid = boidBuffer_read[instanceId];
+
+	float noise = clamp(noise1(DeltaTime / 100.0 + boid.noise_offset), -1, 1) * 2.0 + 1.0;
+	float velocity = BoidSpeed * (1.0 + noise * BoidSpeedVariation);
+	// Make slow birds go faster if far away from flock ?
+	float distance_from_flock = distance(boid.position, FlockPosition);
+	if (distance_from_flock > 50)
+		velocity += distance_from_flock / 50;
+	velocity += min(max(distance(boid.position, FlockPosition) / 50, 1), BoidSpeed * 200);
+
+	float3 boid_pos = boid.position;
+	float3 boid_dir = boid.direction;
+
+	float3 separation = float3(0, 0.0, 0);
+	float3 alignment = float3(0.0, 0.0, 0.0);
+	float3 cohesion = FlockPosition;
+	
+	
+	uint nearbyCount = 1; // Add self that is ignored in loop
+    int3 thisGrid = (int3) GridCalculateCell(boid_pos);
+    position_debug[instanceId] = thisGrid;
+    
+    for (int Z = max(thisGrid.z - 1, 0); Z <= min(thisGrid.z + 1, _GridDim.z - 1); Z++){
+        for (int Y = max(thisGrid.y - 1, 0); Y <= min(thisGrid.y + 1, _GridDim.y - 1); Y++){
+            for (int X = max(thisGrid.x - 1, 0); X <= min(thisGrid.x + 1, _GridDim.x - 1); X++) {
+                uint G_CELL = GridKey(uint3(X, Y, Z));
+                uint2 G_START_END = _GridIndicesBufferRead[G_CELL];
+                for (uint N_ID = G_START_END.x; N_ID < G_START_END.y; N_ID++) {
+                    if (N_ID == instanceId){
+                       continue;
+                    }
+                    float3 thatPos = boidBuffer_read[N_ID].position;
+                    if (distance(boid_pos, thatPos) < NeighbourDistance)
+                    {
+                        float3 tempBoid_position = thatPos;
+                        float3 diff = boid_pos - tempBoid_position;
+                        float diffLen = (length(diff));
+                        float scaler = clamp(1.0 - diffLen / NeighbourDistance, 0.0, 1.0);
+                        separation += diff * (scaler/ diffLen) * 10;
+                        alignment += boidBuffer_read[N_ID].direction*0.8;
+                        cohesion += tempBoid_position;
+                        nearbyCount += 1;
+                    }
+                }
+            }
+        }    
+    }    
+    
+    if (useAffector == 1){
+        float3 diff = 0;
+        for (int i=0; i < AffectorCount; i++){
+            Affector affector = affector_write[i]; 
+            float3 affectorPosition = affector.position;
+            float3 affectorRelativePosition = affectorPosition;
+            //float2 affectorCheckPosition = float2(affectorRelativePosition[0], affectorRelativePosition[1]);
+            //float2 boidCheckPos = float2(boid_pos[0], boid_pos[1]);
+            float3 affectorCheckPosition = affectorRelativePosition;
+            float3 boidCheckPos = float3(boid_pos.x, boid_pos.y, 0);
+            boidCheckPos = ProjectPointOnPlane(boid_pos);
+            if (distance(boidCheckPos, affectorCheckPosition) < AffectorDistance){
+            //if (distance(boidCheckPos, affectorCheckPosition) < AffectorDistance){
+                //diff = boid_pos - float3(affectorRelativePosition[0], affectorRelativePosition[1], boid_pos[2]);
+                diff = boidCheckPos - affectorCheckPosition;
+                //diff = boid_pos - float3(affectorRelativePosition[0], affectorRelativePosition[1], affectorRelativePosition[2]);
+                float diffLen = length(diff);
+                //float scaler = 1 - diffLen / AffectorDistance;
+                float scaler = clamp(1.0-diffLen / AffectorForce, 0.0, 1.0);
+                //separation += scaler*AffectorForce;
+                separation += -1*diff*(scaler/diffLen);
+            }
+        }
+    }
+    
+	
+	float avg = 1.0 / nearbyCount;
+	alignment *= avg;
+	cohesion *= avg;
+	//separation *= avg; 
+	cohesion = normalize(cohesion - boid_pos);
+	float noiseEffector = clamp(noise1(DeltaTime), 0, 1);
+	if (noiseEffector > 0){
+        float3 direction = alignment + separation + cohesion;
+        float ip = exp(-RotationSpeed * DeltaTime);
+        boid.direction = lerp((direction), normalize(boid_dir), ip);
+        //boid.direction *= BoundaryCondition(boid.position, boid.direction);
+        boid.position += (boid.direction) * (velocity * DeltaTime);
+	}
+	else{
+        boid.position += (boid.direction) * (velocity * DeltaTime);
+	}
+	//boid.position += boid.direction; 
+	//boid.position = clamp(boid.position, 0, boxSize);
+	boidBuffer_write[id.x] = boid;
+}
+
